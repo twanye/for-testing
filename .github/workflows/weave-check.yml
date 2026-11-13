@@ -1,0 +1,68 @@
+name: Weave check
+
+# Fast check of the build-time Fabric step: compiles the game and applies the mods in mods/
+# without the long browser link. Uploads the weave report and mods.json.
+
+# The build workflow now runs these checks itself before compiling; this one is for manual debugging.
+on:
+  workflow_dispatch:
+    inputs:
+      debug_class:
+        description: "Print the woven bytecode of this class (e.g. net/minecraft/client/Minecraft.class)"
+        required: false
+      debug_method:
+        description: "...only this method (name)"
+        required: false
+
+env:
+  WORKSPACE_REPO: https://github.com/kingjoeishere/Eaglercraft-26.2-Workspace
+  WORKSPACE_COMMIT: f73bff91f0f0840bc958c09ab536dbba1e146b2e
+
+jobs:
+  weave:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            25
+      - name: Download the Eaglercraft 26.2 workspace
+        run: |
+          git init -q workspace && cd workspace
+          git remote add origin "$WORKSPACE_REPO"
+          git fetch -q --depth 1 origin "$WORKSPACE_COMMIT" && git checkout -q FETCH_HEAD
+          chmod +x gradlew
+      - name: Set up build-time Fabric
+        run: chmod +x loader/weave.sh && loader/weave.sh workspace eml
+      - name: Compile the game, weave the mods, compile the rest against them
+        working-directory: workspace
+        run: ./gradlew --no-daemon --console=plain compileJava
+      - name: Check the woven classes with the browser compiler's front end
+        working-directory: workspace
+        run: |
+          ./gradlew -q --no-daemon :target_teavm_wasm_gc:printTeaVMToolClasspath > ../teavm-cp.txt
+          CP="$(grep '\.jar$' ../teavm-cp.txt | tr '\n' ':')"
+          mkdir -p ../teavm-check
+          javac -nowarn -cp "$CP" -d ../teavm-check ../loader/tools/TeaVMCheck.java
+          java -cp "$CP:../teavm-check" TeaVMCheck game/build/classes/java/main all | tail -80
+      - name: Show a method (debug)
+        if: ${{ inputs.debug_class != '' }}
+        working-directory: workspace/game/build/classes/java/main
+        env:
+          DC: ${{ inputs.debug_class }}
+          DM: ${{ inputs.debug_method }}
+        run: javap -c -p -l "$DC" | awk -v m="$DM" 'index($0, m"(") && /^  [a-z]/ {on=1} on && /^  [a-z].*\(/ && !index($0, m"(") {on=0} on' | head -400
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weave-report
+          path: |
+            eml/weave.log
+            eml/woven/mods.json
+            eml/disabled-injectors.txt
+          retention-days: 14

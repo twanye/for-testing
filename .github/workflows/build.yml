@@ -1,0 +1,207 @@
+name: Build Eaglercraft 26.2
+
+# Builds Eaglercraft 26.2 with the Fabric mods in mods/ built in, as one standalone HTML file.
+# loader/weave.sh hooks build-time Fabric into the workspace's Gradle build; see the README.
+#
+# Test builds (every push that changes mods/ or loader/, and manual runs): faster, lighter compression,
+# readable names in crash reports, published as a pre-release. Release builds (push a tag like v1.0, or a manual run with "release"
+# ticked): maximum compression, published as a normal release.
+
+on:
+  push:
+    branches: [main]
+    paths: ["mods/**", "loader/**", "addons/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release build (maximum compression, published as a normal release)"
+        type: boolean
+        default: false
+      diagnostic:
+        description: "Diagnostic build (readable names in crash reports; published as a draft only you can see)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # The Eaglercraft 26.2 workspace is downloaded at build time and never committed here.
+  WORKSPACE_REPO: https://github.com/kingjoeishere/Eaglercraft-26.2-Workspace
+  WORKSPACE_COMMIT: f73bff91f0f0840bc958c09ab536dbba1e146b2e
+
+jobs:
+  build:
+    runs-on: ubuntu-latest   # public repos: 4 cores, 16 GB RAM
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            25
+
+      - name: Download the Eaglercraft 26.2 workspace
+        run: |
+          git init -q workspace
+          cd workspace
+          git remote add origin "$WORKSPACE_REPO"
+          git fetch -q --depth 1 origin "$WORKSPACE_COMMIT"
+          git checkout -q FETCH_HEAD
+          chmod +x gradlew
+          # Gradle itself is downloaded on first use; retry, since that download sometimes times out
+          for i in 1 2 3 4 5; do ./gradlew --no-daemon --version >/dev/null && break; echo "Gradle download failed (try $i), retrying"; sleep $((i * 20)); done
+
+      - name: Download the mods listed in mods/modrinth.txt
+        run: |
+          if [ -f mods/modrinth.txt ]; then python3 tools/modrinth.py download 26.2 mods/modrinth.txt mods; fi
+          ls mods
+
+      # Quick checks first, so a mod that can't work stops the build in minutes instead of after the
+      # long browser compile.
+      - name: "Check the mods: can each jar be built in? (seconds)"
+        run: |
+          mkdir -p eml
+          python3 loader/scan-mods.py mods eml/mod-check.md workspace || { cat eml/mod-check.md >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          cat eml/mod-check.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up build-time Fabric
+        run: chmod +x loader/weave.sh && loader/weave.sh workspace eml
+
+      - name: "Check the mods: apply them to the game (a few minutes)"
+        working-directory: workspace
+        run: ./gradlew --no-daemon --console=plain :game:compileJava
+
+      - name: Explain a failed mod check
+        if: failure()
+        run: |
+          {
+            echo "## Why the build stopped"; echo
+            if [ -f eml/weave.log ]; then
+              echo "Applying the mods to the game failed. The important part of the log:"; echo; echo '```'
+              grep -E "Incompatible|requires|Mod resolution|Unhandled|Caused by|Exception|ERROR|error:" eml/weave.log | head -40
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo fallocate -l 8G /swapfile2 && sudo chmod 600 /swapfile2 && sudo mkswap /swapfile2 && sudo swapon /swapfile2 || true
+          free -h; df -h /
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Game sounds from Mojang (not in the workspace)
+        run: |
+          python3 loader/fetch-sounds.py 26.2 eml/sounds eml/music
+          cd workspace
+          mkdir -p target_teavm/build/web
+          # the workspace's own EPK packager, run the way its assets.epk task runs it (desktop platform)
+          cat > ../eml/epk.init.gradle <<'EOF2'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.path != ":target_lwjgl_desktop") return
+              ["sounds", "music"].each { n ->
+                p.tasks.register("emlPack_" + n, JavaExec) {
+                  classpath = p.sourceSets.main.runtimeClasspath
+                  mainClass = "net.lax1dude.eaglercraft.v1_8.sp.server.export.EPKPackagerMain"
+                  args(new File(p.rootDir, "../eml/" + n).absolutePath,
+                       new File(p.rootDir, "target_teavm/build/web/" + n + ".epk").absolutePath,
+                       n + ".epk", "--include-web-unreachable")
+                }
+              }
+            }
+          }
+          EOF2
+          ./gradlew --no-daemon --console=plain -I ../eml/epk.init.gradle :target_lwjgl_desktop:emlPack_sounds :target_lwjgl_desktop:emlPack_music
+          ls -la target_teavm/build/web/
+
+      - name: Patch TeaVM for mods (null checks, missing classes, reflection, Files.createDirectories, UTF8)
+        run: |
+          DEPS="$(ls "$PWD"/eml/deps/*.jar | tr '\n' ':')"
+          mkdir -p eml/patch-teavm && cd eml/patch-teavm
+          javac -nowarn -cp "$DEPS" -d . ../../loader/tools/PatchTeaVM.java
+          JAR="$(ls ../../workspace/wasm-toolchain/teavm-eagler-patch/teavm-core-*.jar | head -1)"
+          unzip -o -q "$JAR" org/teavm/model/transformation/NullCheckInsertion.class org/teavm/vm/TeaVM.class org/teavm/dependency/ReferenceResolver.class
+          java -cp "$DEPS:." PatchTeaVM org/teavm/model/transformation/NullCheckInsertion.class org/teavm/vm/TeaVM.class org/teavm/dependency/ReferenceResolver.class
+          jar uf "$JAR" org/teavm/model/transformation/NullCheckInsertion.class org/teavm/vm/TeaVM.class org/teavm/dependency/ReferenceResolver.class
+          # TeaVM's classlib (java.lang.reflect.Constructor/Method, java.nio.file.Files): patched copies go in
+          # Eaglercraft's classlib-override.jar, which every program reads before the stock classlib
+          curl -fsSL --retry 5 -o teavm-classlib.jar https://repo1.maven.org/maven2/org/teavm/teavm-classlib/0.13.1/teavm-classlib-0.13.1.jar
+          CL="org/teavm/classlib/java/lang/reflect/TConstructor.class org/teavm/classlib/java/lang/reflect/TMethod.class org/teavm/classlib/java/nio/file/TFiles.class org/teavm/classlib/java/nio/charset/TCharset.class"
+          unzip -o -q teavm-classlib.jar $CL
+          java -cp "$DEPS:." PatchTeaVM $CL
+          jar uf ../../workspace/wasm-toolchain/teavm-eagler-patch/classlib-override.jar $CL
+
+      - name: Build the standalone HTML
+        working-directory: workspace
+        env:
+          RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release == true }}
+          # test builds keep readable names in crash reports; releases don't
+          DIAGNOSTIC: ${{ inputs.diagnostic == true || !(startsWith(github.ref, 'refs/tags/v') || inputs.release == true) }}
+          EAGLER_BUILD_CAP_MIB: "13312"
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+        run: |
+          mkdir -p ../out
+          npm install --no-audit --no-fund
+          if [ "$RELEASE" = "true" ]; then FAST=""; else FAST="--fast-package"; fi
+          if [ "$DIAGNOSTIC" = "true" ]; then
+            FAST="$FAST --diagnostic"
+            # also keep readable names in the singleplayer server worker's crash reports
+            export EAGLER_SERVER_DIAGNOSTIC=1
+            # the workspace only installs a named server build for local debugging; install it here too
+            sed -i 's/^  if (diagnostic) {$/  if (false) {/' wasm-toolchain/link-server-standalone.js
+            grep -q '^  if (false) {$' wasm-toolchain/link-server-standalone.js
+          fi
+          node wasm-toolchain/build-single-html.js $FAST --output ../out/eaglercraft-26.2-modded.html
+          python3 ../loader/inject-addons.py ../addons ../out/eaglercraft-26.2-modded.html
+          grep -v '^#' ../eml/disabled-injectors.txt > ../out/turned-off-injectors.txt 2>/dev/null || true
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: eaglercraft-26.2-modded
+          path: |
+            out/
+            eml/weave.log
+            eml/gen.log
+          retention-days: 14
+
+      - name: Publish
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release == true }}
+          DIAGNOSTIC: ${{ inputs.diagnostic == true }}
+        run: |
+          if [ "$DIAGNOSTIC" = "true" ]; then
+            tag="diag-${GITHUB_RUN_NUMBER}"; title="Diagnostic build ${GITHUB_RUN_NUMBER}"; kind=(--draft)
+          elif [ "$RELEASE" = "true" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then tag="${GITHUB_REF_NAME}"; else tag="release-${GITHUB_RUN_NUMBER}"; fi
+            title="$tag"; kind=(--latest)
+          else
+            tag="test-${GITHUB_RUN_NUMBER}"; title="Test build ${GITHUB_RUN_NUMBER}"; kind=(--prerelease)
+          fi
+          {
+            if [ "$RELEASE" != "true" ]; then echo "Test build: lighter compression, so the file is a bit larger."; echo; fi
+            echo "Eaglercraft 26.2 with these Fabric mods built in (from ${GITHUB_SHA::7}):"
+            echo; ls mods | grep '\.jar$' | sed 's/^/- /'
+            if ls addons/*.js >/dev/null 2>&1; then echo; echo "Add-ons:"; echo; ls addons/*.js | xargs -n1 basename | sed 's/^/- /'; fi
+            if [ -s eml/mod-check.md ]; then echo; sed 's/^## Mod check$/### Mod check/' eml/mod-check.md; fi
+            if [ -s out/turned-off-injectors.txt ]; then
+              echo; echo "These mod injections don't fit Eaglercraft's version of the game and were turned off:"
+              echo; sed 's/^/- /' out/turned-off-injectors.txt
+            fi
+          } > notes.md
+          gh release create "$tag" out/*.html --title "$title" --notes-file notes.md "${kind[@]}"
