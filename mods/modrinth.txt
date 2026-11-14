@@ -1,9 +1,5 @@
-# Mods downloaded from Modrinth at build time (with the mods they require).
-# One project per line: the slug from its Modrinth URL (modrinth.com/mod/<slug>), or "slug@version" to pin one.
-# The newest Fabric version for Minecraft 26.2 is used. Jars you put in mods/ yourself are built in too.
-#
-# Already in mods/ as jars: Fabric API, Mod Menu (and Placeholder API).
-
-ukus-armor-hud           # Armor Status HUD
-jade                     # Jade (block/entity tooltips)
-bedrockify               # Bedrockify (Bedrock-style features)
+# Fabric mods built into this Eaglercraft 26.2 HTML.
+# Required dependencies are downloaded automatically.
+jade                     # Block and entity tooltips
+appleskin                # Food and saturation HUD
+ukus-armor-hud           # Armor HUD
