@@ -7,3 +7,6 @@
 ukus-armor-hud           # Armor Status HUD
 jade                     # Jade (block/entity tooltips)
 bedrockify               # Bedrockify (Bedrock-style features)
+3dskinlayers
+shulkerboxtooltip
+viafabricplus
