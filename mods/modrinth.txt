@@ -3,3 +3,4 @@
 jade                     # Block and entity tooltips
 appleskin                # Food and saturation HUD
 ukus-armor-hud           # Armor HUD
+vivecraft
